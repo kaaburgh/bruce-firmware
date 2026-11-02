@@ -1,5 +1,9 @@
 name: Experimental T-Embed SD compatibility build
 
+concurrency:
+  group: sd-compat-experimental-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches:
