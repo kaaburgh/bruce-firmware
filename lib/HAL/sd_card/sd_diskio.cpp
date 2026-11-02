@@ -18,6 +18,9 @@
 #include "sd_diskio2.h"
 #include "esp_system.h"
 #include "esp32-hal-periman.h"
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+#include "sd_spi_compat_policy.h"
+#endif
 
 extern "C" {
 #include "ff.h"
@@ -366,12 +369,16 @@ bool sdWriteSectors(uint8_t pdrv, const char *buffer, unsigned long long sector,
       if (currentCount == 0) {
         sdStop(pdrv);
 #if defined(SD_SPI_WAIT_AFTER_STOP_TRAN) && SD_SPI_WAIT_AFTER_STOP_TRAN
-        // Opt-in workaround: some cards report a false CMD13 Error after
-        // CMD25 if CS rises immediately after the 0xFD stop-token.
-        card->spi->transfer(0xFF);
-        const bool stopReady = sdWait(pdrv, 500);
+        // Observed on one SDSC card: CMD13 reports an Error bit unless
+        // Nbr clocks and a programming busy wait precede deselection.
+        // Whether the clock, wait or their combination is necessary is unproven.
+        card->spi->transfer(0xFF); // Nbr byte after 0xFD, CS remains low
+        const bool stopReady = sd_spi_stop_wait::waitReady(
+          [card]() -> uint8_t { return card->spi->transfer(0xFF); },
+          []() -> uint32_t { return millis(); }, 500);
         sdDeselectCard(pdrv);
         if (!stopReady) {
+          log_w("CMD25 Stop Tran busy timeout");
           return false;
         }
 #else
@@ -487,17 +494,7 @@ static unsigned long sdZeroOcrSdscSectors(uint8_t pdrv) {
   if (!ok) {
     return 0;
   }
-  const uint8_t *c = reinterpret_cast<const uint8_t *>(csd);
-  const unsigned structure = c[0] >> 6;
-  const unsigned readBlLen = c[5] & 0x0F;
-  if (structure != 0 || readBlLen < 9 || readBlLen > 11) {
-    return 0;
-  }
-  const uint32_t cSize = ((uint32_t)(c[6] & 3) << 10) | ((uint32_t)c[7] << 2) | ((c[8] & 0xC0) >> 6);
-  const unsigned cSizeMult = ((c[9] & 3) << 1) | ((c[10] & 0x80) >> 7);
-  const uint64_t sectors = ((uint64_t)cSize + 1) << (cSizeMult + 2 + readBlLen - 9);
-  // Reject unreasonably large or invalid v1 CSD: only SDSC <= 2 GiB.
-  return (sectors > 0 && sectors <= 4194304ULL) ? (unsigned long)sectors : 0;
+  return sd_spi_compat::sdscSectorsFromCsd(reinterpret_cast<const uint8_t *>(csd));
 }
 #endif
 
@@ -572,13 +569,22 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
 
     if (!sdTransaction(pdrv, READ_OCR, 0, &resp)) {
 #if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
-      if (zeroOcrCandidate && resp == 0) {
-        zeroOcrSectors = sdZeroOcrSdscSectors(pdrv);
-        if (!zeroOcrSectors) {
-          log_w("Zero OCR: CSD v1.0/CRC validation failed");
+      if (zeroOcrCandidate) {
+        const auto decision = sd_spi_compat::afterZeroPreInitOcr(resp);
+        if (decision == sd_spi_compat::PostOcrDecision::Reject) {
+          log_w("Zero pre-init OCR: invalid post-init OCR 0x%08X", resp);
           goto unknown_card;
         }
-        card->type = CARD_SD; // validated byte-addressed SDSC
+        if (decision == sd_spi_compat::PostOcrDecision::CheckSdscCsd) {
+          zeroOcrSectors = sdZeroOcrSdscSectors(pdrv);
+          if (!zeroOcrSectors) {
+            log_w("Zero OCR: CSD v1.0/CRC validation failed");
+            goto unknown_card;
+          }
+          card->type = CARD_SD;
+        } else {
+          card->type = (resp & (1UL << 30)) ? CARD_SDHC : CARD_SD;
+        }
       } else
 #endif
       if (resp & (1 << 30)) {
