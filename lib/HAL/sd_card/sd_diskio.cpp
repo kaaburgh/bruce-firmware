@@ -365,7 +365,19 @@ bool sdWriteSectors(uint8_t pdrv, const char *buffer, unsigned long long sector,
 
       if (currentCount == 0) {
         sdStop(pdrv);
+#if defined(SD_SPI_WAIT_AFTER_STOP_TRAN) && SD_SPI_WAIT_AFTER_STOP_TRAN
+        // Opt-in workaround: some cards set a spurious CMD13 Error bit if
+        // CS goes high immediately after the CMD25 stop-token (0xFD).
+        // Keep CS asserted for an Nbr byte and the following busy period.
+        card->spi->transfer(0xFF);
+        const bool stopReady = sdWait(pdrv, 500);
         sdDeselectCard(pdrv);
+        if (!stopReady) {
+          return false;
+        }
+#else
+        sdDeselectCard(pdrv);
+#endif
 
         unsigned int resp;
         if (sdTransaction(pdrv, SEND_STATUS, 0, &resp) || resp) {
