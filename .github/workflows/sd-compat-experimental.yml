@@ -22,6 +22,13 @@ jobs:
           python-version: '3.12'
       - name: Install PlatformIO
         run: python -m pip install 'platformio==6.2.0'
+      - name: Test both SD compatibility policies on host
+        run: |
+          set -eu
+          g++ -std=c++11 -Wall -Wextra -Werror -pedantic tests/sd_spi_compat_policy_test.cpp -o /tmp/test_sd_ocr
+          /tmp/test_sd_ocr
+          g++ -std=c++11 -Wall -Wextra -Werror -pedantic tests/sd_spi_stop_wait_test.cpp -o /tmp/test_sd_stop
+          /tmp/test_sd_stop
       - name: Compile flagged T-Embed firmware
         run: python -m platformio run -e lilygo-t-embed-cc1101
       - name: Package app-only and merged images
