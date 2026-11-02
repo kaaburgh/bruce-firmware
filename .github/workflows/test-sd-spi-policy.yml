@@ -1,0 +1,16 @@
+name: SD SPI OCR policy unit tests
+on:
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host C++ OCR/CSD policy tests
+        run: |
+          g++ -std=c++11 -Wall -Wextra -Werror -pedantic tests/sd_spi_compat_policy_test.cpp -o /tmp/sd_spi_policy_test
+          /tmp/sd_spi_policy_test

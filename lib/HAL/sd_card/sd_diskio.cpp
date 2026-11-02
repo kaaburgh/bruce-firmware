@@ -18,6 +18,9 @@
 #include "sd_diskio2.h"
 #include "esp_system.h"
 #include "esp32-hal-periman.h"
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+#include "sd_spi_compat_policy.h"
+#endif
 
 extern "C" {
 #include "ff.h"
@@ -462,11 +465,33 @@ private:
  * FATFS API
  * */
 
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+// Opt-in fallback for old SDSC cards with a valid CMD8 echo and zero CMD58 OCR.
+// Validate CRC-protected CSD v1.0 before assuming byte addressing.
+static unsigned long sdZeroOcrSdscSectors(uint8_t pdrv) {
+  ardu_sdcard_t *card = s_cards[pdrv];
+  if (!card->supports_crc || !sdSelectCard(pdrv)) {
+    return 0;
+  }
+  char csd[16];
+  const bool ok = !sdCommand(pdrv, SEND_CSD, 0, NULL) && sdReadBytes(pdrv, csd, sizeof(csd));
+  sdDeselectCard(pdrv);
+  if (!ok) {
+    return 0;
+  }
+  return sd_spi_compat::sdscSectorsFromCsd(reinterpret_cast<const uint8_t *>(csd));
+}
+#endif
+
 DSTATUS ff_sd_initialize(uint8_t pdrv) {
   char token;
   unsigned int resp;
   unsigned int start;
   ardu_sdcard_t *card = s_cards[pdrv];
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+  bool zeroOcrCandidate = false;
+  unsigned long zeroOcrSectors = 0;
+#endif
 
   if (!(card->status & STA_NOINIT)) {
     return card->status;
@@ -506,7 +531,13 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
       goto unknown_card;
     }
 
-    if (sdTransaction(pdrv, READ_OCR, 0, &resp) != 1 || !(resp & (1 << 20))) {
+    token = sdTransaction(pdrv, READ_OCR, 0, &resp);
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+    if (token == 1 && resp == 0) {
+      zeroOcrCandidate = true;
+    } else
+#endif
+    if (token != 1 || !(resp & (1 << 20))) {
       log_w("READ_OCR failed: %X", resp);
       goto unknown_card;
     }
@@ -522,6 +553,25 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
     }
 
     if (!sdTransaction(pdrv, READ_OCR, 0, &resp)) {
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+      if (zeroOcrCandidate) {
+        const auto decision = sd_spi_compat::afterZeroPreInitOcr(resp);
+        if (decision == sd_spi_compat::PostOcrDecision::Reject) {
+          log_w("Zero pre-init OCR: invalid post-init OCR 0x%08X", resp);
+          goto unknown_card;
+        }
+        if (decision == sd_spi_compat::PostOcrDecision::CheckSdscCsd) {
+          zeroOcrSectors = sdZeroOcrSdscSectors(pdrv);
+          if (!zeroOcrSectors) {
+            log_w("Zero OCR: CSD v1.0/CRC validation failed");
+            goto unknown_card;
+          }
+          card->type = CARD_SD;
+        } else {
+          card->type = (resp & (1UL << 30)) ? CARD_SDHC : CARD_SD;
+        }
+      } else
+#endif
       if (resp & (1 << 30)) {
         card->type = CARD_SDHC;
       } else {
@@ -574,6 +624,12 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
   }
 
   card->sectors = sdGetSectorsCount(pdrv);
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+  if (zeroOcrSectors && card->sectors != zeroOcrSectors) {
+    log_w("Zero OCR: inconsistent CSD capacity");
+    goto unknown_card;
+  }
+#endif
 
   if (card->frequency > 25000000) {
     card->frequency = 25000000;
