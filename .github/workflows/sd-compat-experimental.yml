@@ -1,0 +1,45 @@
+name: Experimental T-Embed SD compatibility build
+
+on:
+  push:
+    branches:
+      - test/sd-transcend-combined
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PlatformIO
+        run: python -m pip install 'platformio==6.2.0'
+      - name: Compile flagged T-Embed firmware
+        run: python -m platformio run -e lilygo-t-embed-cc1101
+      - name: Package app-only and merged images
+        run: |
+          set -eu
+          mkdir -p dist
+          cp .pio/build/lilygo-t-embed-cc1101/firmware.bin dist/app-0x10000.bin
+          cp Bruce-lilygo-t-embed-cc1101.bin dist/merged-0x0.bin
+          {
+            echo 'EXPERIMENTAL: Not upstream Bruce, backup SD first.'
+            echo 'Board: LILYGO T-Embed CC1101 Plus / ESP32-S3'
+            echo 'SD_SPI_ALLOW_ZERO_OCR_SDSC=1'
+            echo 'SD_SPI_WAIT_AFTER_STOP_TRAN=1'
+            echo 'app-0x10000.bin: app partition only, flash at 0x10000 to preserve partition/NVS when layout matches'
+            echo 'merged-0x0.bin: full firmware image at 0x0; may overwrite existing settings/partitions'
+            sha256sum dist/*.bin
+          } > dist/MANIFEST.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: t-embed-cc1101-experimental-sd-compat
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
