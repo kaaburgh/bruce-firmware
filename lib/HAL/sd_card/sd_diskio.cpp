@@ -19,6 +19,10 @@
 #include "esp_system.h"
 #include "esp32-hal-periman.h"
 
+#if defined(SD_SPI_WAIT_AFTER_STOP_TRAN) && SD_SPI_WAIT_AFTER_STOP_TRAN
+#include "sd_spi_stop_wait.h"
+#endif
+
 extern "C" {
 #include "ff.h"
 #include "diskio.h"
@@ -366,13 +370,16 @@ bool sdWriteSectors(uint8_t pdrv, const char *buffer, unsigned long long sector,
       if (currentCount == 0) {
         sdStop(pdrv);
 #if defined(SD_SPI_WAIT_AFTER_STOP_TRAN) && SD_SPI_WAIT_AFTER_STOP_TRAN
-        // Opt-in workaround: some cards set a spurious CMD13 Error bit if
-        // CS goes high immediately after the CMD25 stop-token (0xFD).
-        // Keep CS asserted for an Nbr byte and the following busy period.
-        card->spi->transfer(0xFF);
-        const bool stopReady = sdWait(pdrv, 500);
+        // Observed on one SDSC card: CMD13 reports an Error bit unless
+        // Nbr clocks and a programming busy wait precede deselection.
+        // Whether the clock, wait or their combination is necessary is unproven.
+        card->spi->transfer(0xFF); // Nbr byte after 0xFD, CS remains low
+        const bool stopReady = sd_spi_stop_wait::waitReady(
+          [card]() -> uint8_t { return card->spi->transfer(0xFF); },
+          []() -> uint32_t { return millis(); }, 500);
         sdDeselectCard(pdrv);
         if (!stopReady) {
+          log_w("CMD25 Stop Tran busy timeout");
           return false;
         }
 #else
