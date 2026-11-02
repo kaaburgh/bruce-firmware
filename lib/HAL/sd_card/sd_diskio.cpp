@@ -462,11 +462,43 @@ private:
  * FATFS API
  * */
 
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+// Opt-in fallback for old SDSC cards with a valid CMD8 echo and zero CMD58 OCR.
+// Validate CRC-protected CSD v1.0 before assuming byte addressing.
+static unsigned long sdZeroOcrSdscSectors(uint8_t pdrv) {
+  ardu_sdcard_t *card = s_cards[pdrv];
+  if (!card->supports_crc || !sdSelectCard(pdrv)) {
+    return 0;
+  }
+  char csd[16];
+  const bool ok = !sdCommand(pdrv, SEND_CSD, 0, NULL) && sdReadBytes(pdrv, csd, sizeof(csd));
+  sdDeselectCard(pdrv);
+  if (!ok) {
+    return 0;
+  }
+  const uint8_t *c = reinterpret_cast<const uint8_t *>(csd);
+  const unsigned structure = c[0] >> 6;
+  const unsigned readBlLen = c[5] & 0x0F;
+  if (structure != 0 || readBlLen < 9 || readBlLen > 11) {
+    return 0;
+  }
+  const uint32_t cSize = ((uint32_t)(c[6] & 3) << 10) | ((uint32_t)c[7] << 2) | ((c[8] & 0xC0) >> 6);
+  const unsigned cSizeMult = ((c[9] & 3) << 1) | ((c[10] & 0x80) >> 7);
+  const uint64_t sectors = ((uint64_t)cSize + 1) << (cSizeMult + 2 + readBlLen - 9);
+  // Reject unreasonably large or invalid v1 CSD: only SDSC <= 2 GiB.
+  return (sectors > 0 && sectors <= 4194304ULL) ? (unsigned long)sectors : 0;
+}
+#endif
+
 DSTATUS ff_sd_initialize(uint8_t pdrv) {
   char token;
   unsigned int resp;
   unsigned int start;
   ardu_sdcard_t *card = s_cards[pdrv];
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+  bool zeroOcrCandidate = false;
+  unsigned long zeroOcrSectors = 0;
+#endif
 
   if (!(card->status & STA_NOINIT)) {
     return card->status;
@@ -506,7 +538,13 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
       goto unknown_card;
     }
 
-    if (sdTransaction(pdrv, READ_OCR, 0, &resp) != 1 || !(resp & (1 << 20))) {
+    token = sdTransaction(pdrv, READ_OCR, 0, &resp);
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+    if (token == 1 && resp == 0) {
+      zeroOcrCandidate = true;
+    } else
+#endif
+    if (token != 1 || !(resp & (1 << 20))) {
       log_w("READ_OCR failed: %X", resp);
       goto unknown_card;
     }
@@ -522,6 +560,16 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
     }
 
     if (!sdTransaction(pdrv, READ_OCR, 0, &resp)) {
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+      if (zeroOcrCandidate && resp == 0) {
+        zeroOcrSectors = sdZeroOcrSdscSectors(pdrv);
+        if (!zeroOcrSectors) {
+          log_w("Zero OCR: CSD v1.0/CRC validation failed");
+          goto unknown_card;
+        }
+        card->type = CARD_SD; // validated byte-addressed SDSC
+      } else
+#endif
       if (resp & (1 << 30)) {
         card->type = CARD_SDHC;
       } else {
@@ -574,6 +622,12 @@ DSTATUS ff_sd_initialize(uint8_t pdrv) {
   }
 
   card->sectors = sdGetSectorsCount(pdrv);
+#if defined(SD_SPI_ALLOW_ZERO_OCR_SDSC) && SD_SPI_ALLOW_ZERO_OCR_SDSC
+  if (zeroOcrSectors && card->sectors != zeroOcrSectors) {
+    log_w("Zero OCR: inconsistent CSD capacity");
+    goto unknown_card;
+  }
+#endif
 
   if (card->frequency > 25000000) {
     card->frequency = 25000000;
